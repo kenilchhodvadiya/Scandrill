@@ -1,0 +1,138 @@
+---
+name: race-condition-hunter
+description: Elite race condition / TOCTOU hunting skill for authorized bug bounty, pentests, and CTFs. ALWAYS activate for race condition, TOCTOU, time-of-check-time-of-use, double-spend, limit-overrun, single-packet attack, HTTP/2 parallel request, last-byte sync, Turbo Intruder race, "send group in parallel", coupon/voucher/gift-card reuse, referral/faucet/reward re-claim, withdrawal/transfer double-spend, refund race, 2FA/OTP race bypass, email/phone verification race, invitation/seat/quota overrun, signup email-uniqueness collision, order/inventory oversell, rate-limit bypass via race, non-atomic check-then-write, "test for race condition on $target", "race these requests", or ANY request to find/exploit concurrency bugs where a "once-only" guard can be beaten by firing N requests simultaneously. Drives the full kill chain — candidate mapping → single-packet fire → over-limit detection → impact proof → report. P2/P3 focus, kills theoretical no-gain races upfront.
+---
+
+# Race Condition Hunter
+
+## Overview
+
+**Core principle:** A check and its use are not atomic. Fire N requests in parallel so several pass the CHECK before any completes the ACT — slipping past a "once-only" guard.
+
+```
+Non-atomic operation:
+  1. CHECK (read state)   ← all N attackers enter here
+  2. ...gap...            ← the race window
+  3. ACT  (modify state)  ← N writes collide, guard beaten
+```
+
+The modern, reliable way to hit that window is the **single-packet attack** (James Kettle, "Smashing the State Machine", 2023) — deliver 20–50 requests to arrive within microseconds, eliminating network jitter.
+
+## When to Use
+
+Activate when an endpoint enforces a **limit, uniqueness, or one-time guard** through a read-then-write that isn't wrapped in a DB transaction / atomic update / lock.
+
+**Symptoms that scream "race me":**
+- "This code can only be used once" / one-time coupon, voucher, gift card
+- "One reward per account" — referral, faucet, daily claim, signup bonus
+- Balance check before withdraw / transfer / spend (double-spend)
+- Uniqueness check before insert (email, username, seat, invite)
+- State toggle (enable/disable 2FA, accept/decline invite, publish/moderate)
+- Rate limits and OTP attempt caps (fire before the counter increments)
+
+**When NOT to bother:** a race that produces no tangible over-limit gain is **N/A**. No doubled balance, no extra redemption, no quota breach → drop it. Kill theoretical races upfront.
+
+## Kill Chain
+
+1. **Map candidates** — state-changing endpoints with a check+write (see Target Tiers).
+2. **Baseline** — send the op once, confirm it *correctly* succeeds once.
+3. **Fire** — 20–50 identical requests via single-packet attack (see PoC Templates).
+4. **Detect over-limit** — more than one success / doubled counter / quota exceeded.
+5. **Prove impact** — show the over-limit *result* (negative balance, N redemptions), 3+ reps.
+6. **Report** — impact-first, with the concurrency level and final state.
+
+## Target Tiers (follow the money / the "once" guard)
+
+**Tier 1 — Critical (direct financial):**
+`POST /coupon/redeem` · `/refund` · `/withdraw` · `/transfer` · gift-card redeem · reward-points spend · referral/faucet claim · flash-sale / limited-inventory buy
+
+**Tier 2 — High (privilege / access):**
+`/accept-invitation` (seat limit) · team-member add · email/OTP verify (single-use token) · password-reset token use · `PATCH /2fa/disable` (old/new secret window) · account merge/link · trial activation
+
+**Tier 3 — Medium (workflow integrity):**
+order status transitions · KYC-approval→unlock · publish→moderation bypass · duplicate account creation · leaderboard/score submit · rate-limit bypass
+
+## The Technique
+
+**HTTP/2 single-packet attack (preferred, jitter-free):** open many streams on one connection, hold back the final byte of each, release all last bytes in one TCP packet → server processes near-simultaneously.
+- **Burp Repeater:** add requests to a group → **"Send group in parallel (single-packet attack)"**.
+- **Turbo Intruder:** `engine=Engine.BURP2` with `gate`-synced requests (skeletons in references).
+
+**HTTP/1.1 last-byte sync:** send all requests holding back the final byte, then release together. Turbo Intruder handles this; `wrk` works for crude HTTP/1.1 flooding.
+
+**Tuning:** warm the connection first. Fetch a fresh single-use anti-CSRF token per request only if the endpoint requires it — a stale/shared token can itself throttle you.
+
+## Detection
+
+Run 20–50 concurrent copies of a "should-succeed-once" operation. **Race confirmed if you see:**
+- Multiple `200`/success where exactly one was allowed
+- Two+ resources with the same unique field (email, order id)
+- A counter incremented more than the number of *logical* actions
+- Balance credited twice / debited past zero (negative)
+
+Always compare against a **sequential baseline** that correctly allows only one.
+
+## Common Recipes
+
+- **Coupon stacking:** 20× `POST /redeem {code}` → 20 stacked discounts → negative price.
+- **Withdraw double-spend:** balance 100, 5× `POST /withdraw {amount:100}` → several clear before balance reads zero.
+- **Refund → infinite credit:** buy $10, fire 30× `/refund`, some succeed → $50 credited. Stop at a program-acceptable PoC; never keep real funds.
+- **Email-uniqueness collision:** N× `/signup {email}` → uniqueness check skipped → duplicate accounts → collision/ATO primitives.
+- **2FA race bypass:** submit OTP and `/2fa/disable` concurrently → one reads "enabled" and rejects, the other disables; retry passes.
+- **Invitation race:** accept + decline simultaneously → inconsistent state (member but not listed).
+- **Oversell:** place order while inventory check runs → reserve stock that doesn't exist.
+
+## Cross-Endpoint & Advanced Races
+
+- **Multi-step (state-machine collision):** race the endpoint that *sets* state while the endpoint that *reads* it is mid-flight (e.g. re-apply discount during checkout complete → used twice). Map which endpoint reads state another sets, then collide them.
+- **State-collision → RCE:** "create if not exists" + "run hook on create" → race two creates so a hook fires before authz completes. Upload race: file uploaded → scan starts → second request moves it public before scan finishes.
+
+## Mobile API Races
+
+Same API-level attack: hit the intercepted endpoint with the asyncio/Turbo scripts. Extras: Burp Repeater parallel tabs; ADB launch app instances simultaneously; StoreKit/IAP UI race (rapid purchase-tap); deep-link rapid-open race.
+
+## Source-Code Smell (SAST hint)
+
+Vulnerable = read → conditional → write with **no** transaction/lock/atomic update:
+```js
+const bal = await db.query('SELECT balance ... WHERE id=?');   // CHECK
+if (bal >= amount) await db.query('UPDATE ... balance-? ...');  // USE — gap
+```
+Secure = single atomic statement or row lock:
+```sql
+UPDATE balances SET amount=amount-? WHERE user_id=? AND amount>=?;  -- rows==0 → reject
+-- or: SELECT ... FOR UPDATE inside a transaction
+-- Django: User.objects.filter(id=uid, credits__gte=cost).update(credits=F('credits')-cost)
+```
+
+## Proof-of-Impact Bar & Severity
+
+Show the **over-limit result**, not just "many 200s": two redemptions, doubled balance, N verification rewards, quota exceeded, negative balance.
+- Financial/asset over-limit = **High**, CVSS ~7.5 (note `AC:H` — attack complexity high).
+- Reproduce **3+ times**; capture the concurrency level, hold/gate details, and before/after state.
+- No tangible over-limit gain = **N/A**. Don't submit it.
+
+## Real Paid Examples (HackerOne)
+
+| Program | Bug | Payout |
+|---|---|---|
+| Cosmos | faucet race via starport | $5k |
+| Tools-for-Humanity | race bypasses verification check | $3k |
+| InnoGames | race in email activation → infinite diamonds | $2k |
+| Shopify | race on create Location (quota) | $500 |
+| Razer | race in OAuth 2.0 flow | $250 |
+| Helium / HackerOne | transfer-credits race / race joining CTF group | — |
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---|---|
+| Requests spaced by ms (browser/normal Repeater) | Use single-packet attack; jitter kills the window |
+| Reporting "20× 200 OK" with no state change | Prove the over-limit *result* |
+| Shared/stale CSRF token throttles the burst | Fresh single-use token per request only if required |
+| No sequential baseline | Always show it correctly allows one when serialized |
+| Keeping real refunds/withdrawals | Minimal-dollar PoC; reverse it; never profit |
+
+## PoC Templates
+
+Ready-to-paste Turbo Intruder skeletons (gated single-packet + last-byte), Python `asyncio`/`httpx` HTTP/2 racer, threading racer, and a `curl`/`xargs` one-liner live in **references/poc-templates.md**. Tooling: Turbo Intruder, Burp Repeater "Send in parallel", `race-the-web`, `smuggler` (h2 frame races).
